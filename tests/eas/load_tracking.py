@@ -186,7 +186,7 @@ class FreqInvarianceTest(_LoadTrackingBase):
         for freq in cls.freqs:
             confs.append({
                 'tag' : 'freq_{}'.format(freq),
-                'flags' : ['ftrace', 'freeze_userspace'],
+                'flags' : 'ftrace',
                 'cpufreq' : {
                     'freqs' : {cpu: freq},
                     'governor' : 'userspace',
@@ -265,7 +265,7 @@ class CpuInvarianceTest(_LoadTrackingBase):
 
         conf = {
             'tag' : 'cie_conf',
-            'flags' : ['ftrace', 'freeze_userspace'],
+            'flags' : 'ftrace',
             'cpufreq' : {'governor' : 'performance'},
         }
 
