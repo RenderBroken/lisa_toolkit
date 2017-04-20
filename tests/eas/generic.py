@@ -86,7 +86,7 @@ class _EnergyModelTest(LisaTest):
 
         conf = {
             'tag' : 'energy_aware',
-            'flags' : ['ftrace', 'freeze_userspace'],
+            'flags' : 'ftrace',
             'sched_features' : 'ENERGY_AWARE',
         }
 

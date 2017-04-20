@@ -59,7 +59,7 @@ class HeavyLoadTest(LisaTest):
         },
         "confs" : [{
             'tag' : 'energy_aware',
-            'flags' : ['ftrace', 'freeze_userspace'],
+            'flags' : 'ftrace',
             'sched_features' : 'ENERGY_AWARE',
         }]
     }
