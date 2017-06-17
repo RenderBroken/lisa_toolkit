@@ -131,38 +131,52 @@ class TestWorkThroughput(BasicCheckTest):
         match = re.search(r'(total number of events:\s*)([\d.]*)', bench_out)
         return float(match.group(2))
 
-    def _check_work_throughput(self, cpu):
-        seconds = 1.0
-        margin = 0.2
+    def _check_work_throughput(self, cpu, duration, margin):
         frequencies = self.target.cpufreq.list_frequencies(cpu)
         if len(frequencies) == 1:
             return True
+
         original_governor = self.target.cpufreq.get_governor(cpu)
         original_freq = None
         if original_governor == 'userspace':
             original_freq = self.target.cpufreq.get_frequency(cpu)
-        # set userspace governor
+
+        # Set userspace governor
         self.target.cpufreq.set_governor(cpu, 'userspace')
-        # do each freq in turn
+
+        # Run at lowest & highest freq
         result = {}
-        for freq in frequencies:
+        for freq in [frequencies[0], frequencies[-1]]:
             self.target.cpufreq.set_frequency(cpu, freq)
-            result[freq] = self._run_sysbench_work(cpu, seconds)
-        # restore governor
+            result[freq] = self._run_sysbench_work(cpu, duration)
+
+        # Restore governor
         self.target.cpufreq.set_governor(cpu, original_governor)
         if original_freq:
             self.target.cpufreq.set_frequency(cpu, original_freq)
-        # compare work throughput
-        return result[frequencies[0]] < result[frequencies[-1]]
+
+        # Make sure work done at highest OPP is at least some % higher
+        # than work done at lowest OPP - this filters the
+        # +/- 1 sysbench result noise
+        work_diff = result[frequencies[-1]] - result[frequencies[0]]
+        ok = work_diff > result[frequencies[0]] * margin
+        return ok
 
     def test_work_throughput(self):
+        duration = 1.0
+        margin = 0.1
         failed_cpus = []
-        for cpulist in self.env.topology.get_level('cpu'):
-            cpu = cpulist[0]
-            if not self._check_work_throughput(cpu):
+
+        # Run test on each known cpu
+        for cpu in range(self.target.number_of_cpus):
+            if not self._check_work_throughput(cpu, duration, margin):
                 failed_cpus.append(cpu)
-        msg='Work done did not scale with CPU Freq on CPUs: {}'\
-            .format(failed_cpus)
+
+        # Format error message
+        msg='Problems detected on CPUs: {}\n'\
+        'Work at highest OPP wasn\'t {}% bigger than work at lowest OPP on these CPUs'\
+            .format(failed_cpus, margin * 100)
+
         self.assertFalse(len(failed_cpus), msg=msg)
 
 class TestEnergyModelPresent(BasicCheckTest):
@@ -176,8 +190,7 @@ class TestEnergyModelPresent(BasicCheckTest):
                 '- No energy model in kernel')
 
 class TestSchedutilTunables(BasicCheckTest):
-    MAX_UP_RATE_LIMIT_US = 20 * 1e3
-    MAX_DOWN_RATE_LIMIT_US = 20 * 1e3
+    MAX_RATE_LIMIT_US = 20 * 1e3
 
     def test_rate_limit_not_too_high(self):
         """Test that the schedutil ratelimiting is not too harsh"""
@@ -187,30 +200,25 @@ class TestSchedutilTunables(BasicCheckTest):
         self.target.cpufreq.set_all_governors('schedutil')
 
         cpus = set(range(self.target.number_of_cpus))
-        up_limit_fail_cpus = []
-        down_limit_fail_cpus = []
+        fail_cpus = []
+
         while cpus:
             cpu = iter(cpus).next()
             domain = tuple(self.target.cpufreq.get_domain_cpus(cpu))
 
             tunables = self.target.cpufreq.get_governor_tunables(cpu)
-            if int(tunables['up_rate_limit_us']) > self.MAX_UP_RATE_LIMIT_US:
-                up_limit_fail_cpus += domain
-            if int(tunables['down_rate_limit_us']) > self.MAX_DOWN_RATE_LIMIT_US:
-                down_limit_fail_cpus += domain
+            for name, value in tunables.iteritems():
+                if name.endswith('rate_limit_us'):
+                    if int(value) > self.MAX_RATE_LIMIT_US:
+                        fail_cpus += domain
 
             cpus = cpus.difference(domain)
 
         self.assertTrue(
-            up_limit_fail_cpus == [],
-            'schedutil up_rate_limit_us greater than {} on CPUs {}. '
+            fail_cpus == [],
+            'schedutil rate limit greater than {}us on CPUs {}. '
             'Responsiveness will be affected.'.format(
-                self.MAX_UP_RATE_LIMIT_US, up_limit_fail_cpus))
-        self.assertTrue(
-            down_limit_fail_cpus == [],
-            'schedutil down_rate_limit_us greater than {} on CPUs {}. '
-            'Responsiveness will be affected.'.format(
-                self.MAX_DOWN_RATE_LIMIT_US, down_limit_fail_cpus))
+                self.MAX_RATE_LIMIT_US, fail_cpus))
 
 class TestSchedDomainFlags(BasicCheckTest):
     """Test requirements of sched_domain flags"""
@@ -283,7 +291,7 @@ class TestSchedDomainFlags(BasicCheckTest):
         """
         Check that the SD_ASYM_CPUCAPACITY flag gets set when it should
 
-        SD_ASYM_CPUCAPACITY should be set at least on the root domain when a
+        SD_ASYM_CPUCAPACITY should be set at least on the highest domain when a
         system is asymmetric.
 
         - Test that it is set appropriately for the current

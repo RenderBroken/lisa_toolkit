@@ -210,9 +210,14 @@ echo -e "\t${PYTHONPATH//:/\\n\\t}"
 cd $PYDIR
 echo
 echo -n 'Notebook server task: '
-nohup ipython notebook --ip=$IPADDR --port=$PORT \
-                       --NotebookApp.token=$TOKEN \
-                       >$LOGFILE 2>&1 &
+if which ipython >/dev/null; then
+    local cmd=ipython
+else
+    local cmd=jupyter
+fi
+nohup $cmd notebook --ip=$IPADDR --port=$PORT \
+                    --NotebookApp.token=$TOKEN \
+                    >$LOGFILE 2>&1 &
 echo $! >$PIDFILE
 echo $URL >$URLFILE
 cd - >/dev/null
@@ -359,6 +364,7 @@ EOF
 echo -e "\t${PYTHONPATH//:/\\n\\t}"
 
 if [ "x$DEVMODE" == "x1" ]; then
+lisa-check-submods
 cat <<EOF
 Submodules :
 EOF
@@ -371,8 +377,6 @@ cat <<EOF
 Type "lisa-help" for on-line help on available commands
 
 EOF
-
-lisa-check-submods
 
 # Setup default SHELL text color
 echo -e "$LISASHELL_DEFAULT"

@@ -171,7 +171,7 @@ class Executor():
     critical_tasks = {
         'linux': ['init', 'systemd', 'sh', 'ssh'],
         'android': [
-            'sh', 'adbd', 'init',
+            'sh', 'adbd',
             'usb', 'transport',
             # We don't actually need this task but on Google Pixel it apparently
             # cannot be frozen, so the cgroup state gets stuck in FREEZING if we
@@ -559,7 +559,8 @@ class Executor():
             rtapp = wlgen.RTA(self.target,
                         wl_idx, calibration = self.te.calibration())
             rtapp.conf(kind='profile', params=params, loadref=loadref,
-                    cpus=cpus, run_dir=self.te.run_dir)
+                       cpus=cpus, run_dir=self.te.run_dir,
+                       duration=conf.get('duration'))
             return rtapp
 
         if conf['class'] == 'periodic':
@@ -571,7 +572,8 @@ class Executor():
             rtapp = wlgen.RTA(self.target,
                         wl_idx, calibration = self.te.calibration())
             rtapp.conf(kind='profile', params=params, loadref=loadref,
-                    cpus=cpus, run_dir=self.te.run_dir)
+                       cpus=cpus, run_dir=self.te.run_dir,
+                       duration=conf.get('duration'))
             return rtapp
 
         if conf['class'] == 'custom':

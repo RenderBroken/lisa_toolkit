@@ -26,6 +26,10 @@ from collections import namedtuple
 from subprocess import Popen, PIPE, STDOUT
 from time import sleep
 
+import numpy as np
+import pandas as pd
+
+from bart.common.Utils import area_under_curve
 
 # Default energy measurements for each board
 DEFAULT_ENERGY_METER = {
@@ -33,10 +37,6 @@ DEFAULT_ENERGY_METER = {
     # ARM TC2: by default use HWMON
     'tc2' : {
         'instrument' : 'hwmon',
-        'conf' : {
-            'sites' : [ 'A7 Jcore', 'A15 Jcore' ],
-            'kinds' : [ 'energy']
-        },
         'channel_map' : {
             'LITTLE' : 'A7 Jcore',
             'big' : 'A15 Jcore',
@@ -46,10 +46,6 @@ DEFAULT_ENERGY_METER = {
     # ARM Juno: by default use HWMON
     'juno' : {
         'instrument' : 'hwmon',
-        'conf' : {
-            'sites' : [ 'BOARDLITTLE', 'BOARDBIG' ],
-            'kinds' : [ 'energy' ]
-        },
         # if the channels do not contain a core name we can match to the
         # little/big cores on the board, use a channel_map section to
         # indicate which channel is which
@@ -61,8 +57,8 @@ DEFAULT_ENERGY_METER = {
 
 }
 
-EnergyCounter = namedtuple('EnergyCounter', ['site', 'pwr_total' , 'pwr_samples', 'pwr_avg', 'time', 'nrg'])
-EnergyReport = namedtuple('EnergyReport', ['channels', 'report_file'])
+EnergyReport = namedtuple('EnergyReport',
+                          ['channels', 'report_file', 'data_frame'])
 
 class EnergyMeter(object):
 
@@ -103,6 +99,8 @@ class EnergyMeter(object):
             EnergyMeter._meter = HWMon(target, emeter, res_dir)
         elif emeter['instrument'] == 'aep':
             EnergyMeter._meter = AEP(target, emeter, res_dir)
+        elif emeter['instrument'] == 'monsoon':
+            EnergyMeter._meter = Monsoon(target, emeter, res_dir)
         elif emeter['instrument'] == 'acme':
             EnergyMeter._meter = ACME(target, emeter, res_dir)
 
@@ -138,42 +136,61 @@ class HWMon(EnergyMeter):
         self._log.info('Scanning for HWMON channels, may take some time...')
         self._hwmon = devlib.HwmonInstrument(self._target)
 
+        # Decide which channels we'll collect data from.
+        # If the caller provided a channel_map, require that all the named
+        # channels exist.
+        # Otherwise, try using the big.LITTLE core names as channel names.
+        # If they don't match, just collect all available channels.
+
+        available_sites = [c.site for c in self._hwmon.get_channels('energy')]
+
+        self._channels = conf.get('channel_map')
+        if self._channels:
+            # If the user provides a channel_map then require it to be correct.
+            if not all (s in available_sites for s in self._channels.values()):
+                raise RuntimeError(
+                    "Found sites {} but channel_map contains {}".format(
+                        sorted(available_sites), sorted(self._channels.values())))
+        elif self._target.big_core:
+            bl_sites = [self._target.big_core.upper(),
+                        self._target.little_core.upper()]
+            if all(s in available_sites for s in bl_sites):
+                self._log.info('Using default big.LITTLE hwmon channels')
+                self._channels = dict(zip(['big', 'LITTLE'], bl_sites))
+
+        if not self._channels:
+            self._log.info('Using all hwmon energy channels')
+            self._channels = {site: site for site in available_sites}
+
         # Configure channels for energy measurements
-        self._log.debug('Enabling channels %s', conf['conf'])
-        self._hwmon.reset(**conf['conf'])
+        self._log.debug('Enabling channels %s', self._channels.values())
+        self._hwmon.reset(kinds=['energy'], sites=self._channels.values())
 
         # Logging enabled channels
         self._log.info('Channels selected for energy sampling:')
         for channel in self._hwmon.active_channels:
             self._log.info('   %s', channel.label)
 
-        # record the HWMon channels
-        self._channels = conf.get('channel_map', {
-            'LITTLE': self._target.little_core.upper(),
-            'big': self._target.big_core.upper()
-        })
 
     def sample(self):
         if self._hwmon is None:
             return None
         samples = self._hwmon.take_measurement()
         for s in samples:
-            label = s.channel.label\
-                    .replace('_energy', '')\
-                    .replace(" ", "_")
+            site = s.channel.site
             value = s.value
 
-            if label not in self.readings:
-                self.readings[label] = {
+            if site not in self.readings:
+                self.readings[site] = {
                         'last'  : value,
                         'delta' : 0,
                         'total' : 0
                         }
                 continue
 
-            self.readings[label]['delta'] = value - self.readings[label]['last']
-            self.readings[label]['last']  = value
-            self.readings[label]['total'] += self.readings[label]['delta']
+            self.readings[site]['delta'] = value - self.readings[site]['last']
+            self.readings[site]['last']  = value
+            self.readings[site]['total'] += self.readings[site]['delta']
 
         self._log.debug('SAMPLE: %s', self.readings)
         return self.readings
@@ -182,9 +199,9 @@ class HWMon(EnergyMeter):
         if self._hwmon is None:
             return
         self.sample()
-        for label in self.readings:
-            self.readings[label]['delta'] = 0
-            self.readings[label]['total'] = 0
+        for site in self.readings:
+            self.readings[site]['delta'] = 0
+            self.readings[site]['total'] = 0
         self._log.debug('RESET: %s', self.readings)
 
     def report(self, out_dir, out_file='energy.json'):
@@ -194,14 +211,13 @@ class HWMon(EnergyMeter):
         nrg = self.sample()
         # Reformat data for output generation
         clusters_nrg = {}
-        for channel in self._channels:
-            if channel not in nrg:
+        for channel, site in self._channels.iteritems():
+            if site not in nrg:
                 raise RuntimeError('hwmon channel "{}" not available. '
                                    'Selected channels: {}'.format(
                                        channel, nrg.keys()))
-            label = self._channels[channel]
-            nrg_total = nrg[label]['total']
-            self._log.debug('Energy [%16s]: %.6f', label, nrg_total)
+            nrg_total = nrg[site]['total']
+            self._log.debug('Energy [%16s]: %.6f', site, nrg_total)
             clusters_nrg[channel] = nrg_total
 
         # Dump data as JSON file
@@ -209,96 +225,86 @@ class HWMon(EnergyMeter):
         with open(nrg_file, 'w') as ofile:
             json.dump(clusters_nrg, ofile, sort_keys=True, indent=4)
 
-        return EnergyReport(clusters_nrg, nrg_file)
+        return EnergyReport(clusters_nrg, nrg_file, None)
 
-class AEP(EnergyMeter):
-
-    def __init__(self, target, conf, res_dir):
-        super(AEP, self).__init__(target, res_dir)
-
-        # Energy channels
-        self.channels = []
-
-        # Time (start and diff) for power measurment
-        self.time = {}
-
-        # Configure channels for energy measurements
-        self._log.info('AEP configuration')
-        self._log.info('    %s', conf)
-        self._aep = devlib.EnergyProbeInstrument(
-            self._target, labels=conf['channel_map'], **conf['conf'])
-
-        # Configure channels for energy measurements
-        self._log.debug('Enabling channels')
-        self._aep.reset()
-
-        # Logging enabled channels
-        self._log.info('Channels selected for energy sampling:')
-        self._log.info('   %s', str(self._aep.active_channels))
-        self._log.debug('Results dir: %s', self._res_dir)
-
-    def _get_energy(self, samples, time, idx, site):
-        pwr_total = 0
-        pwr_samples = 0
-        for sample in samples:
-            pwr_total += sample[idx].value
-            pwr_samples += 1
-
-        pwr_avg = pwr_total / pwr_samples
-        nrg = pwr_avg * time
-
-        ec = EnergyCounter(site, pwr_total, pwr_samples, pwr_avg, time, nrg)
-        return ec
-
-    def _sample(self, csv_file):
-        if self._aep is None:
-            return
-
-        self.time['diff'] = time.time() - self.time['start']
-        self._aep.stop()
-
-        csv_data = self._aep.get_data(csv_file)
-        samples = csv_data.measurements()
-
-        # Calculate energy for each channel
-        for idx,channel in enumerate(csv_data.channels):
-            if channel.kind is not 'power':
-                continue
-            ec = self._get_energy(samples, self.time['diff'], idx, channel.site)
-            self.channels.append(ec)
+class _DevlibContinuousEnergyMeter(EnergyMeter):
+    """Common functionality for devlib Instruments in CONTINUOUS mode"""
 
     def reset(self):
-        if self._aep is None:
-            return
-
-        self.channels = []
-        self._log.debug('RESET: %s', self.channels)
-
-        self._aep.start()
-        self.time['start'] = time.time()
+        self._instrument.start()
 
     def report(self, out_dir, out_energy='energy.json', out_samples='samples.csv'):
-        if self._aep is None:
-            return
+        self._instrument.stop()
 
-        # Retrieve energy consumption data
-        csv_file = '{}/{}'.format(out_dir, out_samples)
-        self._sample(csv_file)
+        csv_path = os.path.join(out_dir, out_samples)
+        csv_data = self._instrument.get_data(csv_path)
+        with open(csv_path) as f:
+            # Each column in the CSV will be headed with 'SITE_measure'
+            # (e.g. 'BAT_power'). Convert that to a list of ('SITE', 'measure')
+            # tuples, then pass that as the `names` parameter to read_csv to get
+            # a nested column index. None of devlib's standard measurement types
+            # have '_' in the name so this use of rsplit should be fine.
+            exp_headers = [c.label for c in csv_data.channels]
+            headers = f.readline().strip().split(',')
+            if set(headers) != set(exp_headers):
+                raise ValueError(
+                    'Unexpected headers in CSV from devlib instrument. '
+                    'Expected {}, found {}'.format(sorted(headers),
+                                                   sorted(exp_headers)))
+            columns = [tuple(h.rsplit('_', 1)) for h in headers]
+            # Passing `names` means read_csv doesn't expect to find headers in
+            # the CSV (i.e. expects every line to hold data). This works because
+            # we have already consumed the first line of `f`.
+            df = pd.read_csv(f, names=columns)
 
-        # Reformat data for output generation
+        sample_period = 1. / self._instrument.sample_rate_hz
+        df.index = np.linspace(0, sample_period * len(df), num=len(df))
+
+        if df.empty:
+            raise RuntimeError('No energy data collected')
+
         channels_nrg = {}
-        for channel in self.channels:
-            self._log.debug('Energy [%16s]: %.6f',
-                            channel.site, channel.nrg)
-            channels_nrg[channel.site] = channel.nrg
+        for site, measure in df:
+            if measure == 'power':
+                channels_nrg[site] = area_under_curve(df[site]['power'])
 
         # Dump data as JSON file
         nrg_file = '{}/{}'.format(out_dir, out_energy)
         with open(nrg_file, 'w') as ofile:
             json.dump(channels_nrg, ofile, sort_keys=True, indent=4)
 
-        return EnergyReport(channels_nrg, nrg_file)
+        return EnergyReport(channels_nrg, nrg_file, df)
 
+class AEP(_DevlibContinuousEnergyMeter):
+
+    def __init__(self, target, conf, res_dir):
+        super(AEP, self).__init__(target, res_dir)
+
+        # Configure channels for energy measurements
+        self._log.info('AEP configuration')
+        self._log.info('    %s', conf)
+        self._instrument = devlib.EnergyProbeInstrument(
+            self._target, labels=conf.get('channel_map'), **conf['conf'])
+
+        # Configure channels for energy measurements
+        self._log.debug('Enabling channels')
+        self._instrument.reset()
+
+        # Logging enabled channels
+        self._log.info('Channels selected for energy sampling:')
+        self._log.info('   %s', str(self._instrument.active_channels))
+        self._log.debug('Results dir: %s', self._res_dir)
+
+class Monsoon(_DevlibContinuousEnergyMeter):
+    """
+    Monsoon Solutions energy monitor
+    """
+
+    def __init__(self, target, conf, res_dir):
+        super(Monsoon, self).__init__(target, res_dir)
+
+        self._instrument = devlib.MonsoonInstrument(self._target, **conf['conf'])
+        self._instrument.reset()
 
 _acme_install_instructions = '''
 
@@ -493,6 +499,6 @@ class ACME(EnergyMeter):
         with open(nrg_stats_file, 'w') as ofile:
             json.dump(channels_stats, ofile, sort_keys=True, indent=4)
 
-        return EnergyReport(channels_nrg, nrg_file)
+        return EnergyReport(channels_nrg, nrg_file, None)
 
 # vim :set tabstop=4 shiftwidth=4 expandtab
