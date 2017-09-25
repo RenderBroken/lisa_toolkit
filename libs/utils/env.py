@@ -37,6 +37,7 @@ from conf import JsonConf
 from platforms.juno_energy import juno_energy
 from platforms.hikey_energy import hikey_energy
 from platforms.pixel_energy import pixel_energy
+from platforms.op5_energy import op5_energy
 
 USERNAME_DEFAULT = 'root'
 PASSWORD_DEFAULT = ''
@@ -443,6 +444,12 @@ class TestEnv(ShareState):
             self.nrg_model = pixel_energy
             self.__modules = ['bl', 'cpufreq']
             platform = Platform(model='pixel')
+            
+        # Initialize OP5 phone
+        elif self.conf['board'].upper() == 'OP5':
+            self.nrg_model = op5_energy
+            self.__modules = ['bl', 'cpufreq']
+            platform = Platform(model='op5')
 
         # Initialize gem5 platform
         elif self.conf['board'].upper() == 'GEM5':
